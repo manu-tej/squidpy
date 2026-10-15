@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 import pytest
 from anndata import AnnData
 from pandas.testing import assert_frame_equal
 
 from squidpy._constants._pkg_constants import Key
 from squidpy.gr import co_occurrence, spatial_autocorr
-from squidpy.gr._ppatterns import _find_min_max
+from squidpy.gr._ppatterns import _co_occurrence_helper, _find_min_max, _occur_count
 
 MORAN_K = "moranI"
 GEARY_C = "gearyC"
@@ -201,6 +202,95 @@ def test_co_occurrence_missing_labels_raise(adata: AnnData):
     adata.obs.loc[adata.obs_names[:3], "leiden"] = np.nan
     with pytest.raises(ValueError, match=r"contains missing values"):
         co_occurrence(adata, cluster_key="leiden", copy=True)
+
+
+def _occur_count_reference(
+    x: np.ndarray, y: np.ndarray, thresholds: np.ndarray, labs: np.ndarray, k: int
+) -> np.ndarray:
+    # per-threshold scan over all ordered pairs of distinct points, in IEEE float32 like the kernel
+    counts = np.zeros((k, k, len(thresholds)), dtype=np.int64)
+    for i in range(len(x)):
+        dx = (x[i] - x).astype(np.float32)
+        dy = (y[i] - y).astype(np.float32)
+        d2 = (dx * dx + dy * dy).astype(np.float32)
+        within = d2[:, None] <= thresholds[None, :]  # (n, l_val)
+        within[i] = False
+        for b in range(k):
+            counts[labs[i], b] += within[labs == b].sum(axis=0)
+    return counts
+
+
+@pytest.mark.parametrize("layout", ["uniform", "lattice"])
+@pytest.mark.parametrize("n_chunks", [1, 7])
+def test_occur_count_matches_pairwise_scan(layout: str, n_chunks: int):
+    rng = np.random.default_rng(0)
+    n, k = 600, 5
+    if layout == "lattice":  # integer coordinates give many exactly tied distances
+        coords = np.array([(i * 69, j * 120) for i in range(25) for j in range(24)], dtype=np.float32)
+    else:
+        coords = rng.uniform(0, 1000, size=(n, 2)).astype(np.float32)
+    x, y = coords[:, 0], coords[:, 1]  # strided views, as co_occurrence passes them
+    labs = rng.integers(0, k, size=n).astype(np.int32)
+    labs[:50] = 3  # label 4 stays rare, label 3 common
+    d_min, d_max = _find_min_max(coords)
+    pair_d2 = (x[:40, None] - x[None, 40:80]) ** 2 + (y[:40, None] - y[None, 40:80]) ** 2
+    thresholds_sets = [
+        np.linspace(d_min, d_max, 50, dtype=np.float32)[1:] ** 2,
+        np.linspace(d_min, d_max, 3, dtype=np.float32)[1:] ** 2,
+        np.sort(pair_d2.ravel()[:64]).astype(np.float32),  # thresholds equal to actual squared distances
+        np.array([69.0, 120.0, 120.0, 138.0, 1e6], dtype=np.float32) ** 2,  # repeated thresholds
+        np.array([0.0, 0.0], dtype=np.float32),
+        np.array([100.0**2, np.inf], dtype=np.float32),
+    ]
+    for thresholds in thresholds_sets:
+        expected = _occur_count_reference(x, y, thresholds, labs, k)
+        actual = _occur_count(x, y, thresholds, labs, k, n_chunks)
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_co_occurrence_exact_at_threshold():
+    # the squared distance of this pair equals the squared threshold in float32; a fused multiply-add
+    # would round it above the threshold and drop the pair from the first bin
+    adata = AnnData(obs=pd.DataFrame({"ct": pd.Categorical(["a", "b"])}, index=["c0", "c1"]))
+    adata.obsm["spatial"] = np.array([[285.46524, 257.36044], [204.76054, 35.444046]], dtype=np.float32)
+    occ, _ = co_occurrence(adata, cluster_key="ct", copy=True, interval=np.array([0.0, 236.13583, 472.27167]))
+
+    assert occ.shape == (2, 2, 2)
+    assert occ[0, 1, 1] > 0
+    np.testing.assert_array_equal(occ[..., 0], occ[..., 1])
+
+
+def test_co_occurrence_helper_threshold_order():
+    # _find_min_max can return min > max, which gives a descending interval; counts must follow its order
+    rng = np.random.default_rng(1)
+    coords = rng.uniform(0, 500, size=(300, 2)).astype(np.float32)
+    labs = rng.integers(0, 3, size=300).astype(np.int32)
+    ascending = np.array([0, 50, 120, 200, 400], dtype=np.float32)  # the first value is not a threshold
+    descending = np.array([1000, 400, 200, 120, 50], dtype=np.float32)
+    occ_asc = _co_occurrence_helper(coords[:, 0], coords[:, 1], ascending, labs, 3, 2)
+    occ_desc = _co_occurrence_helper(coords[:, 0], coords[:, 1], descending, labs, 3, 2)
+
+    assert occ_asc[0, 1, 0] != occ_asc[0, 1, -1]
+    np.testing.assert_array_equal(occ_desc[..., ::-1], occ_asc)
+
+
+def test_co_occurrence_unused_category(adata: AnnData):
+    # the result is indexed by the categories, so an unused category gets an all-zero row and column
+    expected, _ = co_occurrence(adata, cluster_key="leiden", copy=True)
+    categories = list(adata.obs["leiden"].cat.categories)
+    adata.obs["leiden"] = adata.obs["leiden"].cat.add_categories(["unused"])
+    adata.obs["leiden"] = adata.obs["leiden"].cat.reorder_categories(["unused", *categories])
+    actual, _ = co_occurrence(adata, cluster_key="leiden", copy=True)
+
+    assert actual.shape == (expected.shape[0] + 1, expected.shape[1] + 1, expected.shape[2])
+    np.testing.assert_array_equal(actual[0], 0)
+    np.testing.assert_array_equal(actual[:, 0], 0)
+    np.testing.assert_array_equal(actual[1:, 1:], expected)
+
+
+def test_co_occurrence_nan_interval_raises(adata: AnnData):
+    with pytest.raises(ValueError, match=r"NaN"):
+        co_occurrence(adata, cluster_key="leiden", copy=True, interval=np.array([0.0, np.nan, 200.0]))
 
 
 @pytest.mark.parametrize("size", [1, 3])

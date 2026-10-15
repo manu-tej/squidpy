@@ -9,7 +9,7 @@ import numba.types as nt
 import numpy as np
 import pandas as pd
 from anndata import AnnData
-from numba import njit, prange
+from numba import get_num_threads, njit, prange
 from scanpy import logging as logg
 from scanpy.metrics import gearys_c, morans_i
 from scipy import stats
@@ -304,69 +304,129 @@ def _score_helper(
     return score_perms
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+# fastmath is set explicitly on the counting kernels: numba lets a callee inherit the flag from its caller,
+# and the comparisons below must be exact IEEE float32 (no fused multiply-add, infinities kept).
+@njit(fastmath=False, cache=True)
+def _bin_lookup(thresholds: NDArrayA) -> tuple[NDArrayA, float, int]:
+    """
+    Lookup table giving, for a squared distance, a threshold index at or before the first threshold it fits.
+
+    Distance up to the largest threshold is cut into ``m`` equal steps of width ``w``. Entry ``b`` is the first
+    threshold whose square is at least ``(b * w) ** 2``, so every earlier threshold is below any squared
+    distance of at least ``(b * w) ** 2``. Thresholds must be ascending.
+    """
+    l_val = len(thresholds)
+    m = min(max(64, 16 * l_val), 1 << 22)  # the one-step guard below needs m * 2**-24 < 1
+    d_max = np.sqrt(np.float64(thresholds[l_val - 1]))
+    # any positive step width gives a valid lower bound; a unit step covers zero and infinite thresholds
+    w = d_max / m if 0.0 < d_max < np.inf else 1.0
+    lower = (np.arange(m + 2) * w) ** 2
+    lut = np.minimum(np.searchsorted(thresholds.astype(np.float64), lower), l_val - 1)
+    return lut, 1.0 / w, m
+
+
+@njit(parallel=True, fastmath=False, cache=True)
 def _occur_count(  # noqa: PLR0917, numba requires positional arguments
-    spatial_x: NDArrayA, spatial_y: NDArrayA, thresholds: NDArrayA, label_idx: NDArrayA, n: int, k: int, l_val: int
+    spatial_x: NDArrayA,
+    spatial_y: NDArrayA,
+    thresholds: NDArrayA,
+    label_idx: NDArrayA,
+    k: int,
+    n_chunks: int,
 ) -> NDArrayA:
-    # Allocate a 2D array to store a flat local result per point.
-    k2 = k * k
-    local_results = np.zeros((n, l_val * k2), dtype=np.int32)
+    """
+    Count, for every ordered pair of labels and every ascending threshold, the pairs of points within that distance.
 
-    for i in prange(n):
-        for j in range(n):
-            if i == j:
-                continue
-            dx = spatial_x[i] - spatial_x[j]
-            dy = spatial_y[i] - spatial_y[j]
-            d2 = dx * dx + dy * dy
+    Each unordered pair of points is visited once and binned at the first threshold its squared distance
+    does not exceed; the bins are then accumulated over thresholds and symmetrised. The comparisons are
+    the same ``d2 <= threshold`` tests as a per-threshold scan, in IEEE float32, so the counts are exact.
+    Memory is ``n_chunks * k * k * len(thresholds)`` int64 counters, independent of the number of points.
+    """
+    n = len(spatial_x)
+    l_val = len(thresholds)
+    thr_max = thresholds[l_val - 1]
+    lut, inv_w, lut_max = _bin_lookup(thresholds)
 
-            pair = label_idx[i] * k + label_idx[j]  # fixed in r-loop
-            base = pair * l_val  # first cell for that pair
+    # one histogram per chunk of rows (one chunk per thread); rows are interleaved so the triangular work is balanced
+    hist = np.zeros((n_chunks, k, k, l_val), dtype=np.int64)
+    for c in prange(n_chunks):
+        h = hist[c]
+        for i in range(c, n, n_chunks):
+            x_i = spatial_x[i]
+            y_i = spatial_y[i]
+            h_i = h[label_idx[i]]
+            for j in range(i + 1, n):
+                dx = x_i - spatial_x[j]
+                dy = y_i - spatial_y[j]
+                d2 = dx * dx + dy * dy
+                if d2 <= thr_max:
+                    # start one lookup step below the distance, so rounding cannot overshoot, then scan forward
+                    b = np.int64(np.sqrt(d2) * inv_w) - 1
+                    if b < 0:
+                        b = 0
+                    elif b > lut_max:
+                        b = lut_max
+                    r = lut[b]
+                    while d2 > thresholds[r]:
+                        r += 1
+                    h_i[label_idx[j], r] += 1
 
+    # pairs per bin -> pairs within each threshold, summed over chunks, then both orders of each pair
+    counts = np.zeros((k, k, l_val), dtype=np.int64)
+    for c in range(n_chunks):
+        for a in range(k):
+            for b in range(k):
+                run = 0
+                for r in range(l_val):
+                    run += hist[c, a, b, r]
+                    counts[a, b, r] += run
+    result = np.empty((k, k, l_val), dtype=np.int64)
+    for a in range(k):
+        for b in range(k):
             for r in range(l_val):
-                if d2 <= thresholds[r]:
-                    local_results[i][base + r] += 1
-
-    # reduction and reshape stay the same
-    result_flat = local_results.sum(axis=0)
-    result: NDArrayA = result_flat.reshape(k, k, l_val)
+                result[a, b, r] = counts[a, b, r] + counts[b, a, r]
 
     return result
 
 
 @njit(parallel=True, fastmath=True, cache=True)
-def _co_occurrence_helper(v_x: NDArrayA, v_y: NDArrayA, v_radium: NDArrayA, labs: NDArrayA) -> NDArrayA:
+def _co_occurrence_helper(  # noqa: PLR0917, numba requires positional arguments
+    v_x: NDArrayA, v_y: NDArrayA, v_radium: NDArrayA, labs: NDArrayA, k: int, n_chunks: int
+) -> NDArrayA:
     """
     Fast co-occurrence probability computation using the new numba-accelerated counting.
 
     Parameters
     ----------
-    v_x : np.ndarray, float64
+    v_x : np.ndarray, float32
          x-coordinates.
-    v_y : np.ndarray, float64
+    v_y : np.ndarray, float32
          y-coordinates.
-    v_radium : np.ndarray, float64
-         Distance thresholds (in ascending order).
+    v_radium : np.ndarray, float32
+         Distance thresholds (in any order).
     labs : np.ndarray
-         Cluster labels (as integers).
+         Cluster labels (as integers in ``range(k)``).
+    k : int
+         Number of clusters.
+    n_chunks : int
+         Number of row chunks the counting is split into.
 
     Returns
     -------
     occ_prob : np.ndarray
          A 3D array of shape (k, k, len(v_radium)-1) containing the co-occurrence probabilities.
-    labs_unique : np.ndarray
-         Array of unique labels.
     """
-    n = len(v_x)
-    labs_unique = np.unique(labs)
-    k = len(labs_unique)
     # l_val is the number of bins; here we assume the thresholds come from v_radium[1:].
     l_val = len(v_radium) - 1
     # Compute squared thresholds from the interval (skip the first value)
     thresholds = (v_radium[1:]) ** 2
 
-    # Compute co-occurence counts.
-    counts = _occur_count(v_x, v_y, thresholds, labs, n, k, l_val)
+    # Compute co-occurence counts on ascending thresholds, then restore the order of v_radium.
+    order = np.argsort(thresholds, kind="mergesort")
+    counts_sorted = _occur_count(v_x, v_y, thresholds[order], labs, k, n_chunks)
+    counts = np.empty_like(counts_sorted)
+    for r in range(l_val):
+        counts[:, :, order[r]] = counts_sorted[:, :, r]
 
     occ_prob = np.zeros((k, k, l_val), dtype=np.float64)
     row_sums = counts.sum(axis=0)
@@ -415,7 +475,7 @@ def co_occurrence(
     Otherwise, modifies the ``adata`` with the following keys:
 
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_co_occurrence']['occ']`` - the co-occurrence probabilities
-          across interval thresholds.
+          across interval thresholds. The first two axes follow ``adata.obs[cluster_key].cat.categories``.
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_co_occurrence']['interval']`` - the distance thresholds
           computed at ``interval``.
     """
@@ -429,6 +489,10 @@ def co_occurrence(
     if (labs < 0).any():
         # code -1 would index out of bounds in the kernel (the old per-cell dict raised KeyError)
         raise ValueError(f"`adata.obs[{cluster_key!r}]` contains missing values.")
+    # the codes index the categories, unused ones included; count on the used codes only
+    k = len(original_clust.cat.categories)
+    used, labs = np.unique(labs, return_inverse=True)
+    labs = labs.astype(ip)
 
     # create intervals thresholds
     if isinstance(interval, int):
@@ -438,12 +502,16 @@ def co_occurrence(
         interval = np.array(sorted(interval), dtype=fp, copy=True)
     if len(interval) <= 1:
         raise ValueError(f"Expected interval to be of length `>= 2`, found `{len(interval)}`.")
+    if np.isnan(interval).any():
+        raise ValueError("Expected interval to contain no NaN.")
 
     spatial_x = spatial[:, 0]
     spatial_y = spatial[:, 1]
 
     # Compute co-occurrence probabilities using the fast numba routine.
-    out = _co_occurrence_helper(spatial_x, spatial_y, interval, labs)
+    out_used = _co_occurrence_helper(spatial_x, spatial_y, interval, labs, len(used), get_num_threads())
+    out = np.zeros((k, k, out_used.shape[2]), dtype=out_used.dtype)
+    out[np.ix_(used, used)] = out_used
     start = logg.info(f"Calculating co-occurrence probabilities for `{len(interval)}` intervals")
 
     if copy:

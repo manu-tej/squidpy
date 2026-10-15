@@ -107,6 +107,12 @@ class TestGraph(PlotTester, metaclass=PlotTesterMeta):
         pl.co_occurrence(adata, cluster_key=C_KEY, clusters=["0", "2"])
         self.compare("Graph_co_occurrence", tolerance=70)
 
+    def test_co_occurrence_unused_category(self, adata: AnnData):
+        adata.obs[C_KEY] = adata.obs[C_KEY].cat.add_categories(["unused"])
+        gr.co_occurrence(adata, cluster_key=C_KEY)
+
+        pl.co_occurrence(adata, cluster_key=C_KEY, clusters=["0", "2"])
+
     def test_tol_plot_co_occurrence_palette(self, adata_palette: AnnData):
         adata = adata_palette
         gr.co_occurrence(adata, cluster_key=C_KEY)
